@@ -1,0 +1,296 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black,
+  pdftitle={Coflect HITL: Non-Blocking Human-in-the-Loop Training with Asynchronous Live Explainability},
+  pdfauthor={Shivam Bharadwaj}
+}
+
+\title{Coflect HITL: Non-Blocking Human-in-the-Loop Training\\\large Asynchronous Live Explainability for Fast Training Loops}
+\author{Shivam Bharadwaj\\Coflect}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report describes the technical design of \textbf{Coflect HITL}, a human-in-the-loop deep learning framework built around one central systems constraint: interactive explainability must not stall the training loop.
+Coflect isolates heavy explainability and intervention scheduling into asynchronous workers, while the trainer emits only compact scalar and metadata events.
+The system integrates live attribution overlays, deterministic text/ROI feedback, and top-$k$ failure forecasting under explicit compute budgets.
+The implementation is Torch-first with an operational TensorFlow/Keras path and a thin backend adapter interface for future frameworks \cite{paszke2019pytorch,abadi2016tensorflow,jax2018github}.
+In a documented long-run benchmark on CPU synthetic workload, minimal Coflect instrumentation remains within the targeted overhead envelope (mean elapsed-time delta $-0.37\%$, mean steps/sec delta $+0.27\%$), supporting the practical claim that live HITL controls can be integrated with near-zero training-throughput penalty when heavy work is decoupled.
+\end{abstract}
+
+\section{Introduction}
+Human-in-the-loop training is often proposed as an answer to late-stage model debugging, but many implementations are either offline (post hoc only) or operationally expensive during training.
+Coflect HITL is designed as an engineering system for continuous intervention during optimization, not as a visualization afterthought.
+
+The design target is explicit:
+\begin{enumerate}[leftmargin=1.5em]
+  \item training throughput should not regress materially because a user opens the dashboard,
+  \item heavy explainability must never run on the trainer hot path,
+  \item trainer-worker communication should use small, stable JSON messages,
+  \item the UI should receive only scalars, compact metadata, and compressed attribution images.
+\end{enumerate}
+
+This report documents the architecture and implementation choices that operationalize those targets.
+
+\section{Design Requirements and Non-Negotiable Constraints}
+Coflect HITL is built around four hard constraints:
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Do not slow training with visualization.}
+  \item \textbf{Do not block training on XAI.} Attribution generation must run in a separate process and can run on a separate device.
+  \item \textbf{Avoid trainer-side synchronization pressure.} Any expensive post-processing is shifted out of trainer compute steps.
+  \item \textbf{Restrict UI payloads.} UI payloads are limited to scalar metrics, small metadata, and compressed attribution images.
+\end{enumerate}
+
+These constraints influence process boundaries, communication contracts, and the choice of deterministic feedback parsing instead of a generative in-loop interpreter.
+
+\section{System Architecture}
+\subsection{Runtime Topology}
+Coflect HITL runs as a multi-process topology:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Backend (FastAPI):} event ingest, WebSocket broadcast, feedback store, backend-scoped XAI queue, backend-scoped forecast queue \cite{fastapi}.
+  \item \textbf{Trainer (Torch or TensorFlow):} performs optimization, emits compact metrics, enqueues XAI requests, emits compact forecast telemetry, polls feedback periodically.
+  \item \textbf{XAI worker:} loads latest snapshots asynchronously, computes LiveCAM/Grad-CAM/SmoothGrad overlays, publishes compressed PNG payloads.
+  \item \textbf{Forecast worker (CPU-only):} ranks likely future failures and controls intervention-window opening based on gating logic.
+  \item \textbf{UI:} static dashboard served by backend at \texttt{/}, receiving live events over WebSocket and posting user feedback over REST.
+\end{itemize}
+
+\subsection{Control Plane vs Data Plane}
+Coflect separates traffic classes:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{Control-plane events} (small JSON): metrics, queue requests, feedback state transitions, forecast gates, worker status.
+  \item \textbf{Visualization payloads} (compressed): attribution overlays as \texttt{png\_b64} only, generated out-of-process.
+\end{itemize}
+
+No raw high-volume tensor streams are pushed directly from trainer to UI.
+
+\subsection{Message Contracts}
+Key event/request payloads are schema-like dataclasses (e.g., \texttt{XaiRequestPayload} with \texttt{step}, \texttt{sample\_idx}, classes, risk metadata, backend tag).
+Wire helpers are intentionally fail-soft: network errors are logged at debug level and do not crash trainer execution.
+
+\section{Trainer-Side HITL Mechanism}
+\subsection{Deterministic Text Instruction Parsing}
+Free-text instructions are parsed by a deterministic regex/rule parser (no in-loop LLM calls):
+\begin{itemize}[leftmargin=1.5em]
+  \item absolute focus strength commands (e.g., \texttt{focus=0.3}),
+  \item signed strength deltas (increase/decrease by percent or scalar),
+  \item ROI commands via normalized coordinates (\texttt{x0,y0,x1,y1}), rectangle form (\texttt{x,y,w,h}), and region keywords (center, top-left, etc.).
+\end{itemize}
+
+This yields reproducible policy updates and removes nondeterministic control from the optimization loop.
+
+\subsection{Feedback Application and Pause/Resume}
+Trainer polls backend feedback at configurable cadence (\texttt{feedback\_poll\_every}).
+Feedback can:
+\begin{itemize}[leftmargin=1.5em]
+  \item set \texttt{paused=true/false},
+  \item set/adjust \texttt{focus\_lambda},
+  \item define ROI box or dense \texttt{roi\_mask},
+  \item target sample-specific rules (bounded map, currently capped to 10 entries).
+\end{itemize}
+
+Applied state transitions are emitted as \texttt{trainer\_feedback\_applied} events for auditability.
+
+\subsection{Auxiliary ROI Objective (Cheap by Construction)}
+The auxiliary objective is intentionally sparse:
+\begin{itemize}[leftmargin=1.5em]
+  \item computed every \texttt{aux\_every} steps,
+  \item evaluated on a small subset (\texttt{aux\_subset}),
+  \item only active when \texttt{focus\_lambda>0} and an ROI policy exists.
+\end{itemize}
+
+For both Torch and TensorFlow trainers, masked inputs are generated from ROI policy and routed through an additional loss pass:
+\begin{equation}
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{primary}} + \lambda_{\text{focus}}\,\mathcal{L}_{\text{aux}}.
+\end{equation}
+
+By making cadence and subset explicit, this channel remains intervention-capable but computationally bounded.
+
+\subsection{Asynchronous Snapshot Sync}
+Trainer snapshots are written by a background thread (queue size 1) using atomic temp-file replace:
+\begin{itemize}[leftmargin=1.5em]
+  \item Torch: \texttt{model\_step\_\{step\}.pt}
+  \item TensorFlow: \texttt{model\_step\_\{step\}.npz}
+\end{itemize}
+
+Queue size 1 intentionally drops stale snapshots, preserving newest-state availability while minimizing trainer-side I/O pressure.
+
+\section{Live Explainability Pipeline (LiveCAM)}
+\subsection{XAI Worker Lifecycle}
+Each XAI worker loops over backend queue dequeue calls:
+\begin{enumerate}[leftmargin=1.5em]
+  \item dequeue compact XAI request,
+  \item load latest snapshot if newer than currently loaded model step,
+  \item regenerate input sample by \texttt{sample\_idx},
+  \item compute attribution,
+  \item emit \texttt{xai\_image} and \texttt{xai\_timing} events.
+\end{enumerate}
+
+This design fully decouples attribution from trainer step execution.
+
+\subsection{Attribution Methods}
+LiveCAM worker supports method selection:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{gradcam/livecam}: class activation map \cite{selvaraju2017gradcam},
+  \item \texttt{smoothgrad}: averaged noisy input-gradient saliency \cite{smilkov2017smoothgrad},
+  \item \texttt{consensus}: normalized blend of Grad-CAM and SmoothGrad.
+\end{itemize}
+
+Outputs include a heatmap overlay and derived metadata:
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{xai\_agreement} between Grad-CAM and SmoothGrad,
+  \item \texttt{focus\_bbox} (normalized),
+  \item top class probabilities,
+  \item per-request XAI latency \texttt{xai\_ms}.
+\end{itemize}
+
+\subsection{Budget Guardrail}
+Workers enforce a rolling attribution budget using a 60-second sliding window over measured attribution times:
+\begin{equation}
+\sum_{(t_i,m_i)\in\mathcal{W}_{60s}} m_i \leq B_{\text{ms/min}}.
+\end{equation}
+If budget is exhausted, request execution is skipped and \texttt{xai\_budget\_skip} is emitted.
+This bounds explainability compute without touching trainer loop timing.
+
+\section{Forecast Worker and HITL Window Scheduling}
+\subsection{Why Forecast-Gated Intervention}
+Instead of showing arbitrary wrong predictions, Coflect ranks candidates likely to remain problematic over the next horizon and opens intervention windows only when training has matured sufficiently.
+
+\subsection{Telemetry and Per-Sample State}
+Trainer sends compact telemetry samples (e.g., \(p_{true}\), margin, correctness, predicted class, sample index) at configurable cadence.
+Forecast worker maintains rolling per-sample histories and epoch-level accuracy counters.
+
+\subsection{Risk Function}
+For each sample with sufficient history, risk is computed as:
+\begin{equation}
+\begin{aligned}
+\text{risk} =\;&0.40\,\text{err\_rate}
++0.25\,(1-\overline{p}_{true})
++0.15\,(1-\widetilde{m}) \\
+&+0.15\,\text{flip\_rate}
++0.05\,\text{stagnation},
+\end{aligned}
+\end{equation}
+where \(\widetilde{m}\) is normalized margin and stagnation increases when confidence trend worsens.
+Scores are clamped to \([0,1]\).
+
+\subsection{Intervention-Window Gates}
+A review window opens only when all gates pass:
+\begin{itemize}[leftmargin=1.5em]
+  \item warmup passed,
+  \item competence above chance + margin,
+  \item accuracy plateau condition,
+  \item residual error floor remains,
+  \item top-$k$ candidate stability overlap,
+  \item cooldown after last intervention.
+\end{itemize}
+
+Window transitions emit explicit \texttt{hitl\_window} events.
+When open, forecast candidates are proactively enqueued as \texttt{request\_kind=forecast} XAI requests.
+
+\section{Backend Abstraction and Extensibility}
+Coflect defines a minimal backend adapter contract with four methods:
+\begin{center}
+\texttt{forward}, \texttt{loss}, \texttt{step}, \texttt{attribution}.
+\end{center}
+
+Current state:
+\begin{itemize}[leftmargin=1.5em]
+  \item \textbf{TorchAdapter}: production path.
+  \item \textbf{TensorFlowAdapter}: MVP runtime path integrated with trainer and XAI worker.
+  \item \textbf{JaxAdapter}: scaffold interface pending integration tests.
+\end{itemize}
+
+This keeps module logic backend-agnostic while allowing backend-specific performance tuning under a stable contract.
+
+\section{Performance Characteristics}
+\subsection{Benchmark Setup}
+A documented long-run benchmark artifact is included in the repository benchmark folder (timestamped 2026-02-28 UTC), using CPU synthetic workload with 200-step runs and repeated measurements \cite{coflectbenchmark2026}.
+
+\subsection{Observed Overhead}
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+Configuration & Mean Elapsed (s) & Mean Steps/s \\
+\midrule
+Baseline trainer & 105.8076 & 1.8934 \\
+Coflect minimal instrumentation & 105.4117 & 1.8985 \\
+\bottomrule
+\end{tabular}
+\caption{Reported benchmark summary from bundled artifact.}
+\label{tab:overhead}
+\end{table}
+
+Derived comparison in artifact:
+\begin{itemize}[leftmargin=1.5em]
+  \item elapsed-time delta: \(-0.374\%\),
+  \item steps/sec delta: \(+0.268\%\).
+\end{itemize}
+
+Interpretation: for the measured setup, minimal HITL instrumentation is effectively overhead-neutral.
+This aligns with the design objective of preserving training throughput when heavy paths are disabled or offloaded.
+
+\subsection{Why Throughput Impact Stays Low}
+Three implementation choices dominate:
+\begin{enumerate}[leftmargin=1.5em]
+  \item asynchronous snapshot writer with stale-drop queue,
+  \item small JSON-only trainer emissions,
+  \item separate-process explainability and CPU-only forecasting.
+\end{enumerate}
+
+\section{Operational Interface}
+\subsection{CLI and Notebook Modes}
+Coflect supports two practical workflows:
+\begin{itemize}[leftmargin=1.5em]
+  \item one-command launcher (backend + trainer + workers),
+  \item notebook-native bridge that can auto-start sidecar services and preserve research workflow structure.
+\end{itemize}
+
+\subsection{Event Observability}
+Event types include metrics, queueing events, snapshot queue notifications, feedback application records, window transitions, and XAI timing.
+This creates an operational trace useful for post-mortem and reproducibility.
+
+\section{Limitations and Current Boundaries}
+\begin{itemize}[leftmargin=1.5em]
+  \item TensorFlow/Keras path is marked experimental in the support policy.
+  \item JAX backend is currently scaffolded but not yet integrated end-to-end.
+  \item Current benchmark evidence is synthetic CPU; broader real-dataset GPU benchmarks are still required.
+  \item LiveCAM quality remains attribution-method dependent; agreement metrics are provided, but interpretation still requires human judgment.
+\end{itemize}
+
+\section{Roadmap}
+Near-term engineering priorities:
+\begin{enumerate}[leftmargin=1.5em]
+  \item extend backend parity (Torch and TensorFlow feature convergence, then JAX integration),
+  \item strengthen dataset-aware notebook-to-worker coupling in packaged deployments,
+  \item expand benchmark matrix across hardware classes and real datasets,
+  \item introduce more modality-aware attribution decomposition for multimodal models.
+\end{enumerate}
+
+\section{Conclusion}
+Coflect HITL demonstrates a systems-first approach to interactive training: maintain training-loop simplicity, offload heavy explanation and forecasting, and preserve deterministic operator control.
+The architecture shows that live explainability, forecasted intervention windows, and text/ROI feedback can coexist with near-zero throughput regression when process boundaries and message contracts are designed explicitly for performance.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
